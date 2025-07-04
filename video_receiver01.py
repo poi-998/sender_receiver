@@ -20,6 +20,10 @@ class Receiver(object):
 
         self.last_seq_num = -1
         self.received_packets = {}
+        self.window_size = 100
+
+        self.ack_count = 0
+        self.sent_ack = -1
 
         self.poller = select.poll()
         self.poller.register(self.sock, ALL_FLAGS)
@@ -55,15 +59,13 @@ class Receiver(object):
             data = datagram_pb2.Data()
             data.ParseFromString(serialized_data)
 
-            self.received_packets[data.seq_num] ={
-                'send_ts':data.send_ts,
-                'sent_bytes':data.sent_bytes,
-                'delivered_time':data.delivered_time,
-                'delivered':data.delivered,
-                'payload':data.payload
-            }
-
-            ack = datagram_pb2.Ack()
+            # self.received_packets[data.seq_num] ={
+            #     'send_ts':data.send_ts,
+            #     'sent_bytes':data.sent_bytes,
+            #     'delivered_time':data.delivered_time,
+            #     'delivered':data.delivered,
+            #     'payload':data.payload
+            # }
             # ack.seq_num = data.seq_num
             # ack.send_ts = data.send_ts
             # ack.sent_bytes = data.sent_bytes
@@ -71,21 +73,62 @@ class Receiver(object):
             # ack.delivered = data.delivered
             # ack.ack_bytes = len(serialized_data)
 
-            if data.seq_num == self.last_seq_num+1:
-                self.last_seq_num = data.seq_num
-                sys.stderr.write("Receive-----Normal,seq_num=%d\n" % data.seq_num)
-            else:
-                sys.stderr.write("Receive-----Repeated,seq_num=%d\n" % data.seq_num)
+            # if data.seq_num == self.last_seq_num+1:
+            #     self.last_seq_num = data.seq_num
+            #     sys.stderr.write("Receive-----Normal,seq_num=%d\n" % data.seq_num)
+            # else:
+            #     sys.stderr.write("Receive-----Repeated,seq_num=%d\n" % data.seq_num)
 
+            if data.seq_num <= self.last_seq_num:
+                sys.stderr.write("Receiver--old packet\n")
+            elif data.seq_num <= self.last_seq_num + self.window_size:
+                self.received_packets[data.seq_num] ={
+                'send_ts':data.send_ts,
+                'sent_bytes':data.sent_bytes,
+                'delivered_time':data.delivered_time,
+                'delivered':data.delivered,
+                'payload':data.payload
+                }
+                sys.stderr.write("Receiver--Buffer data_seq=%d\n" %data.seq_num)
+            else:
+                sys.stderr.write("Receiver--Out of window%d\n" %data.seq_num)
+                continue
             
+            advanced = False
+            while(self.last_seq_num +1) in self.received_packets:
+                self.last_seq_num += 1
+                self.received_packets.pop(self.last_seq_num)
+                advanced = True
+
+            ack = datagram_pb2.Ack()
             ack.seq_num = self.last_seq_num
-            ack.send_ts = self.received_packets[ack.seq_num]['send_ts']
-            ack.sent_bytes = self.received_packets[ack.seq_num]['sent_bytes']
-            ack.delivered_time = self.received_packets[ack.seq_num]['delivered_time']
-            ack.delivered = self.received_packets[ack.seq_num]['delivered']
-            ack.ack_bytes = len(serialized_data)
             
-            self.sock.sendto(ack.SerializeToString(), addr)
+            pkt_info = self.received_packets.get(self.last_seq_num,{
+                'send_ts':data.send_ts,
+                'sent_bytes':data.sent_bytes,
+                'delivered_time':data.delivered_time,
+                'delivered':data.delivered
+            })
+            
+            ack.send_ts = pkt_info['send_ts']
+            ack.sent_bytes = pkt_info['sent_bytes']
+            ack.delivered_time = pkt_info['delivered_time']
+            ack.delivered = pkt_info['delivered']
+            ack.ack_bytes = len(serialized_data)
+
+            if advanced:
+                self.ack_count = 0
+                self.sent_ack = ack.seq_num
+                self.sock.sendto(ack.SerializeToString(), addr)
+                sys.stderr.write("Receiver--ACK_sent seq=%d\n" %ack.seq_num)
+            else:
+                if ack.seq_num == self.sent_ack and self.ack_count < 3:
+                    self.sock.sendto(ack.SerializeToString(), addr)
+                    self.ack_count += 1
+                    sys.stderr.write("Receiver--Repeated ACK for seq =%d\n" %ack.seq_num)
+            
+            # self.sock.sendto(ack.SerializeToString(), addr)
+            # sys.stderr.write("Receiver--ACK seq=%d\n" %ack.seq_num)
 
             # ack = self.construct_ack_from_data(serialized_data)
             # if ack is not None:
