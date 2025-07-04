@@ -1,0 +1,1 @@
+src/experiments/test.py local --schemes "lingbo" -t 60 --uplink-trace bandwide_trace/ATT-LTE-driving.up --downlink-trace bandwide_trace/ATT-LTE-driving.down --prepend-mm-cmds "mm-file-delay rtt_test_trace/sin_5g_bus.txt 100 mm-loss uplink 0.01" --append-mm-cmds "--uplink-queue=droptail --uplink-queue-args=packets=500"
