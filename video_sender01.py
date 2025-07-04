@@ -172,7 +172,7 @@ class VideoSender(object):
         curr_time_ms = self.curr_ts_ms()
         # ACK
         acked_seq = ack.seq_num
-        sack_list = list(ack.sack_blocks)
+        # sack_list = list(ack.sack_blocks)
         # ACK
         # if acked_seq >= self.next_ack:
         #     self.next_ack = acked_seq + 1
@@ -180,7 +180,7 @@ class VideoSender(object):
         #     for k in keys_to_del:
         #         del self.ack_counts[k]
          
-        if acked_seq == self.next_ack:
+        if acked_seq >= self.next_ack:
             #logic error
             self.next_ack = acked_seq+1
             sys.stderr.write("Sender-----Normal ACK for next=%d\n" % self.next_ack)
@@ -192,6 +192,7 @@ class VideoSender(object):
             self.ack_counts[acked_seq] = self.ack_counts.get(acked_seq, 0)+1
             if self.ack_counts[acked_seq] >= 3:
                 self.fast_retransmit(acked_seq+1)
+            
         
         
         # Update RTT
@@ -267,6 +268,8 @@ class VideoSender(object):
             sys.stderr.write("Fast Retransmit Error")
             return
         
+        self.next_ack = seq_num
+        
         serialized_data = self.sent_packets[seq_num]
         self.sock.sendto(serialized_data, self.peer_addr)
 
@@ -283,11 +286,13 @@ class VideoSender(object):
         print(self.cwnd)
 
     def window_is_open(self):
+        if self.seq_num-self.next_ack <self.cwnd:
+            sys.stderr.write("cant send\n")
         return self.seq_num - self.next_ack < self.cwnd
 
     def send(self):
-        if not self.can_send():
-            return
+        # if not self.can_send():
+        #     return
         # sys.stderr.write('sending ' + str(self.seq_num) + '\n')
         data = datagram_pb2.Data()
         data.seq_num = self.seq_num
@@ -482,8 +487,3 @@ class VideoSender(object):
                 if flag & WRITE_FLAGS:
                     if self.window_is_open():
                         self.send()
-
-
-
-
-    
