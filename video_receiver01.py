@@ -15,7 +15,8 @@ class Receiver(object):
         # UDP socket and poller
         self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 65536)
         self.sock.bind(('0.0.0.0', port))
 
         self.last_seq_num = -1
@@ -81,7 +82,8 @@ class Receiver(object):
 
             if data.seq_num <= self.last_seq_num:
                 sys.stderr.write("Receiver--old packet\n")
-            elif data.seq_num <= self.last_seq_num + self.window_size:
+            # elif data.seq_num <= self.last_seq_num + self.window_size:
+            else:
                 self.received_packets[data.seq_num] ={
                 'send_ts':data.send_ts,
                 'sent_bytes':data.sent_bytes,
@@ -90,9 +92,9 @@ class Receiver(object):
                 'payload':data.payload
                 }
                 sys.stderr.write("Receiver--Buffer data_seq=%d\n" %data.seq_num)
-            else:
-                sys.stderr.write("Receiver--Out of window%d\n" %data.seq_num)
-                continue
+            # else:
+            #     sys.stderr.write("Receiver--Out of window%d\n" %data.seq_num)
+            #     continue
             
             advanced = False
             while(self.last_seq_num +1) in self.received_packets:
@@ -122,10 +124,11 @@ class Receiver(object):
                 self.sock.sendto(ack.SerializeToString(), addr)
                 sys.stderr.write("Receiver--ACK_sent seq=%d\n" %ack.seq_num)
             else:
-                if ack.seq_num == self.sent_ack and self.ack_count < 3:
-                    self.sock.sendto(ack.SerializeToString(), addr)
-                    self.ack_count += 1
-                    sys.stderr.write("Receiver--Repeated ACK for seq =%d\n" %ack.seq_num)
+                # if ack.seq_num == self.sent_ack and self.ack_count < 3:
+                # if ack.seq_num == self.sent_ack:
+                self.sock.sendto(ack.SerializeToString(), addr)
+                self.ack_count += 1
+                sys.stderr.write("Receiver--Repeated ACK for seq =%d\n" %ack.seq_num)
             
             # self.sock.sendto(ack.SerializeToString(), addr)
             # sys.stderr.write("Receiver--ACK seq=%d\n" %ack.seq_num)
