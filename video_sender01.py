@@ -61,7 +61,8 @@ class VideoSender(object):
         self.retransmit_flags={}
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 65536)
         
         self.poller = select.poll()
         self.poller.register(self.sock, ALL_FLAGS)
@@ -187,10 +188,16 @@ class VideoSender(object):
             keys_to_del = [k for k in self.ack_counts if k <=acked_seq]
             for k in keys_to_del:
                 del self.ack_counts[k]
+            self.ack_counts.clear()
+            keys_to_del = [k for k in self.sent_packets if k <= acked_seq]
+            for k in keys_to_del:
+                del self.sent_packets[k]
+
         else:
             sys.stderr.write("Sender-----Error ACK for ack=%d\n" % acked_seq)
             self.ack_counts[acked_seq] = self.ack_counts.get(acked_seq, 0)+1
-            if self.ack_counts[acked_seq] >= 3:
+            #once fast_retransmit
+            if self.ack_counts[acked_seq] == 3:
                 self.fast_retransmit(acked_seq+1)
             
         
@@ -286,13 +293,13 @@ class VideoSender(object):
         print(self.cwnd)
 
     def window_is_open(self):
-        if self.seq_num-self.next_ack <self.cwnd:
-            sys.stderr.write("cant send\n")
+        # if self.seq_num-self.next_ack <self.cwnd:
+        #     sys.stderr.write("can send\n")
         return self.seq_num - self.next_ack < self.cwnd
 
     def send(self):
-        # if not self.can_send():
-        #     return
+        if not self.can_send():
+            return
         # sys.stderr.write('sending ' + str(self.seq_num) + '\n')
         data = datagram_pb2.Data()
         data.seq_num = self.seq_num
