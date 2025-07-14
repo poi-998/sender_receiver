@@ -1,0 +1,84 @@
+非常专业的问题！SRTT（Smoothed RTT，平滑往返时延）是 TCP 超时重传机制的核心，它的初始值对 RTO 和整体重传行为有关键影响。
+
+⸻
+
+✅ 结论（简洁回答）
+
+在传统 TCP 实现中：
+
+SRTT 初始值是发送端在收到第一个 RTT 样本之后设定的，之前并不使用预测或默认值。
+
+也就是说：
+	•	✅ SRTT 不在连接建立时预设
+	•	✅ 第一次测到 RTT（即收到第一个 ACK）时，SRTT 就被初始化为这个值
+	•	✅ 之后再用 EWMA 平滑更新
+
+⸻
+
+✅ 在 Linux TCP 栈中的实现（参考 RFC 和源码）
+
+在 Linux 的 tcp_rcv_rtt_measure() 中：
+
+if (tp->srtt == 0) {
+    tp->srtt = measured_rtt << 3;        // 初始 SRTT，乘以8是因为内部单位是1/8 ms
+    tp->rttvar = measured_rtt << 1;      // 初始 RTTVAR = RTT * 1
+    tp->rto = tp->srtt + max(1, 4*tp->rttvar);
+}
+
+也就是说：
+	•	✅ 第一次 RTT 样本 = measured_rtt
+	•	✅ 初始 SRTT = measured_rtt
+	•	✅ 初始 RTTVAR = measured_rtt
+	•	✅ 初始 RTO = SRTT + 4 × RTTVAR
+
+这些公式来源于 RFC 6298，是 TCP 超时重传的标准计算方式。
+
+⸻
+
+✅ RFC 6298 官方说明
+
+Until a round-trip time (RTT) measurement has been made for a segment, the sender SHOULD set RTO to 1 second.
+
+也就是说：
+	•	未获得任何 RTT 时，使用一个默认 RTO（比如 1 秒）
+	•	获得第一个 RTT 样本后，用该值初始化 SRTT 和 RTTVAR
+
+⸻
+
+✅ 在你项目中如何实现 SRTT 初始值？
+
+你 Lingbo 项目中 RTT 是这样计算的：
+
+rtt = curr_ts_ms - ack.send_ts
+self.srtt = rtt
+
+你在第一次收 RTT 样本时做了初始化：
+
+if len(self.min_rtts) >= 4 and self.init_state:
+    self.init_state = False
+
+但你没有显式地实现 RFC 中的 RTTVAR 初始化和 RTO 计算，可以考虑补充为：
+
+if self.srtt == 0:
+    self.srtt = rtt
+    self.rttvar = rtt / 2
+    self.rto = self.srtt + 4 * self.rttvar
+
+之后用 EWMA 更新：
+
+alpha = 0.125
+beta = 0.25
+self.rttvar = (1 - beta) * self.rttvar + beta * abs(self.srtt - rtt)
+self.srtt = (1 - alpha) * self.srtt + alpha * rtt
+self.rto = self.srtt + 4 * self.rttvar
+
+
+⸻
+
+✅ 总结表格
+
+项目	初始行为
+SRTT	第一个 RTT 样本测得后设为该值
+RTTVAR	初始为 RTT / 2
+RTO	SRTT + 4 × RTTVAR
+第一个 RTT 前	默认 RTO = 1 秒（或配置值），SRTT 未定义
