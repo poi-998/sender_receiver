@@ -52,6 +52,7 @@ class VideoSender(object):
 
         #data_save
         self.sent_packets = {}
+        
         self.sack_blocks = set()
 
         # UDP socket and poller
@@ -106,6 +107,11 @@ class VideoSender(object):
         self.step_cnt = 0
         self.done = False
         self.start_time = None
+
+        self.rto = 0.
+        self.rttd = 0.
+        self.rto_recovery = False
+        self.rttvar = 0.
 
         self.ts_first = None
         self.rtt_buf = []
@@ -171,6 +177,7 @@ class VideoSender(object):
         #self.min_loss = 0#self.loss_ratio(ack)
         self.loss_buff.append([ack.send_ts, ack.seq_num])
         curr_time_ms = self.curr_ts_ms()
+        MAX_RTO = 60000
         # ACK
         acked_seq = ack.seq_num
         # sack_list = list(ack.sack_blocks)
@@ -185,6 +192,10 @@ class VideoSender(object):
             #logic error
             self.next_ack = acked_seq+1
             sys.stderr.write("Sender-----Normal ACK for next=%d\n" % self.next_ack)
+            new_info = ("Sender-----Normal ACK for next=%d\n" % self.next_ack)
+            with open("ack_log.txt","a") as f:
+                f.write(new_info.encode("utf-8"))
+
             keys_to_del = [k for k in self.ack_counts if k <=acked_seq]
             for k in keys_to_del:
                 del self.ack_counts[k]
@@ -195,6 +206,10 @@ class VideoSender(object):
 
         else:
             sys.stderr.write("Sender-----Error ACK for ack=%d\n" % acked_seq)
+            new_info1 = ("Sender-----Error ACK for ack=%d\n" % acked_seq)
+            with open("ack_log.txt","a") as f:
+                f.write(new_info1.encode("utf-8"))
+
             self.ack_counts[acked_seq] = self.ack_counts.get(acked_seq, 0)+1
             #once fast_retransmit
             if self.ack_counts[acked_seq] == 3:
@@ -204,12 +219,11 @@ class VideoSender(object):
         
         # Update RTT
         rtt = float(curr_time_ms - ack.send_ts)
+
         if  self.get_rtt_state and not self.judge_state:
             self.min_rtts.append(rtt)
 
             self.min_rtt,self.min_rtt_std = self.get_95_min_rtt(self.min_rtts)
-       
-
         if self.judge_state and self.get_rtt_state :
             if ack.send_ts < self.last_send_time:
                 self.min_rtts.append(rtt)
@@ -219,13 +233,57 @@ class VideoSender(object):
             if ack.send_ts < self.last_send_time:
                 self.min_rtts.append(rtt)
                 self.min_rtt,self.min_rtt_std = self.get_95_min_rtt(self.min_rtts)
-              
-           
         if len(self.min_rtts) >= 4 and  self.init_state:
             self.init_state = False
-           
 
-        self.srtt = rtt
+        is_retransmitted = self.retransmit_flags.get(ack.seq_num, False)
+        sys.stderr.write("Sender-rto:%d\n" %self.rto)
+        #ack is not retransmit bag
+        if not is_retransmitted:
+            if self.rto_recovery:
+                self.srtt = rtt
+                self.rttvar = rtt/2
+                self.rto = self.srtt + 4 * self.rttvar
+                self.rto_recovery = False
+                sys.stderr.write("RTO reset\n")
+            else:
+                if self.srtt is None:
+                    self.srtt = rtt
+                    self.rttvar = rtt/2
+                else:
+                    self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - rtt)
+                    self.srtt = 0.875 * self.srtt + 0.125*rtt
+                self.rto = self.srtt + 4 * self.rttvar
+            delay = rtt - self.min_rtt
+        #     if self.delay_ewma is None:
+        #         self.delay_ewma = delay
+        #     else:
+        #         self.delay_ewma = 0.875 * self.delay_ewma + 0.125 * delay
+        #     # self.rtt_buf.append(rtt)
+        # else:
+        #     delay = 0.0
+
+        # if  self.get_rtt_state and not self.judge_state:
+        #     self.min_rtts.append(rtt)
+
+        #     self.min_rtt,self.min_rtt_std = self.get_95_min_rtt(self.min_rtts)
+       
+
+        # if self.judge_state and self.get_rtt_state :
+        #     if ack.send_ts < self.last_send_time:
+        #         self.min_rtts.append(rtt)
+        #     else:
+        #         self.tmp_rtts.append(rtt)
+        # if not self.get_rtt_state:
+        #     if ack.send_ts < self.last_send_time:
+        #         self.min_rtts.append(rtt)
+        #         self.min_rtt,self.min_rtt_std = self.get_95_min_rtt(self.min_rtts)
+              
+           
+        # if len(self.min_rtts) >= 4 and  self.init_state:
+        #     self.init_state = False
+           
+        # self.srtt = rtt
 
         if self.ts_first is None:
             self.ts_first = curr_time_ms
@@ -237,6 +295,8 @@ class VideoSender(object):
             self.delay_ewma = delay
         else:
             self.delay_ewma = 0.875 * self.delay_ewma + 0.125 * delay
+        #     self.rttd = 0.75*self.rttd + 0.25*abs(delay)
+        # self.rto = self.delay_ewma + 4*self.rttd
 
         # Update BBR's delivery rate
         self.delivered += ack.ack_bytes
@@ -264,6 +324,9 @@ class VideoSender(object):
     def fast_retransmit(self, seq_num):
         #error
         sys.stderr.write("[Fast Retransmit] Lost packet %d, retransmitting now.\n" % seq_num)
+        new_info2 = ("[Fast Retransmit] Lost packet %d, retransmitting now.\n" % seq_num)
+        with open("ack_log.txt","a") as f:
+            f.write(new_info2.encode("utf-8"))
         # data = datagram_pb2.Data()
         # data.seq_num = seq_num
         # data.send_ts = self.curr_ts_ms()
@@ -277,7 +340,8 @@ class VideoSender(object):
         
         self.next_ack = seq_num
         
-        serialized_data = self.sent_packets[seq_num]
+        pkt_info = self.sent_packets[seq_num]
+        serialized_data = pkt_info['data']
         self.sock.sendto(serialized_data, self.peer_addr)
 
         #tcp_cwnd
@@ -296,6 +360,7 @@ class VideoSender(object):
         # if self.seq_num-self.next_ack <self.cwnd:
         #     sys.stderr.write("can send\n")
         return self.seq_num - self.next_ack < self.cwnd
+    
 
     def send(self):
         if not self.can_send():
@@ -312,10 +377,30 @@ class VideoSender(object):
         serialized_data = data.SerializeToString()
         self.sock.sendto(serialized_data, self.peer_addr)
 
-        self.sent_packets[self.seq_num] = serialized_data
+        self.sent_packets[self.seq_num] = {
+            "data": serialized_data,
+            "send_time": self.curr_ts_ms(),
+            "rto": self.rto
+        }
 
         self.seq_num += 1
         self.sent_bytes += len(serialized_data)
+        
+    def check_timeout_retransmission(self):
+        now = self.curr_ts_ms()
+        MAX_RTO = 60000
+        for seq, pkt_info in list(self.sent_packets.items()):
+            if seq < self.next_ack:
+                continue
+            if now - pkt_info["send_time"] > pkt_info["rto"]:
+                sys.stderr.write("Timeout Retransmit seq =%d ,rto =%d\n" %(seq, pkt_info["rto"]))
+                self.sock.sendto(pkt_info["data"], self.peer_addr)
+                self.sent_packets[seq]["send_time"] = now
+
+                self.retransmit_flags[seq] = True
+                self.rto_recovery = True
+
+                self.rto = min(2*self.rto, MAX_RTO)
 
     def step(self, current_state, duration):
         state = np.roll(self.state, -1, axis=1)
@@ -494,3 +579,4 @@ class VideoSender(object):
                 if flag & WRITE_FLAGS:
                     if self.window_is_open():
                         self.send()
+            self.check_timeout_retransmission()
