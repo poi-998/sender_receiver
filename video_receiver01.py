@@ -92,6 +92,9 @@ class Receiver(object):
                 'payload':data.payload
                 }
                 sys.stderr.write("Receiver--Buffer data_seq=%d\n" %data.seq_num)
+                new_info3 = ("Receiver--Buffer data_seq=%d\n" %data.seq_num)
+                with open("ack_log.txt","a") as f:
+                    f.write(new_info3.encode("utf-8"))
             # else:
             #     sys.stderr.write("Receiver--Out of window%d\n" %data.seq_num)
             #     continue
@@ -123,12 +126,18 @@ class Receiver(object):
                 self.sent_ack = ack.seq_num
                 self.sock.sendto(ack.SerializeToString(), addr)
                 sys.stderr.write("Receiver--ACK_sent seq=%d\n" %ack.seq_num)
+                new_info4 = ("Receiver--ACK_sent seq=%d\n" %ack.seq_num)
+                with open("ack_log.txt","a") as f:
+                    f.write(new_info4.encode("utf-8"))
             else:
                 # if ack.seq_num == self.sent_ack and self.ack_count < 3:
                 # if ack.seq_num == self.sent_ack:
                 self.sock.sendto(ack.SerializeToString(), addr)
                 self.ack_count += 1
                 sys.stderr.write("Receiver--Repeated ACK for seq =%d\n" %ack.seq_num)
+                new_info5 = ("Receiver--Repeated ACK for seq =%d\n" %ack.seq_num)
+                with open("ack_log.txt","a") as f:
+                    f.write(new_info5.encode("utf-8"))
             
             # self.sock.sendto(ack.SerializeToString(), addr)
             # sys.stderr.write("Receiver--ACK seq=%d\n" %ack.seq_num)
