@@ -110,7 +110,7 @@ class VideoSender(object):
 
         self.rto = 0.
         self.rttd = 0.
-        self.rto_recovery = False
+        self.rto_recovery = {}
         self.rttvar = 0.
 
         self.ts_first = None
@@ -203,6 +203,9 @@ class VideoSender(object):
             keys_to_del = [k for k in self.sent_packets if k <= acked_seq]
             for k in keys_to_del:
                 del self.sent_packets[k]
+            for k in list(self.rto_recovery.keys()):
+                if k < acked_seq:
+                    del self.rto_recovery[k]
 
         else:
             sys.stderr.write("Sender-----Error ACK for ack=%d\n" % acked_seq)
@@ -237,14 +240,16 @@ class VideoSender(object):
             self.init_state = False
 
         is_retransmitted = self.retransmit_flags.get(ack.seq_num, False)
-        sys.stderr.write("Sender-rto:%d\n" %self.rto)
+        sys.stderr.write("Sender-ack:%drto:%d\n" %(acked_seq, self.rto))
         #ack is not retransmit bag
+        if is_retransmitted:
+            sys.stderr.write("ignore RTT update\n")
         if not is_retransmitted:
-            if self.rto_recovery:
+            if self.rto_recovery.get(ack.seq_num, False):
                 self.srtt = rtt
                 self.rttvar = rtt/2
-                self.rto = self.srtt + 4 * self.rttvar
-                self.rto_recovery = False
+                self.rto = max(self.srtt + 4 * self.rttvar,200)
+                self.rto_recovery[ack.seq_num] = False
                 sys.stderr.write("RTO reset\n")
             else:
                 if self.srtt is None:
@@ -253,8 +258,8 @@ class VideoSender(object):
                 else:
                     self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - rtt)
                     self.srtt = 0.875 * self.srtt + 0.125*rtt
-                self.rto = self.srtt + 4 * self.rttvar
-            delay = rtt - self.min_rtt
+                self.rto = max(self.srtt + 4 * self.rttvar,200)
+            # delay = rtt - self.min_rtt
         #     if self.delay_ewma is None:
         #         self.delay_ewma = delay
         #     else:
@@ -320,6 +325,9 @@ class VideoSender(object):
         else:
             self.send_rate_ewma = (
                 0.875 * self.send_rate_ewma + 0.125 * send_rate)
+            
+        if ack.seq_num in self.retransmit_flags:
+            del self.retransmit_flags[ack.seq_num]
     
     def fast_retransmit(self, seq_num):
         #error
@@ -389,18 +397,30 @@ class VideoSender(object):
     def check_timeout_retransmission(self):
         now = self.curr_ts_ms()
         MAX_RTO = 60000
-        for seq, pkt_info in list(self.sent_packets.items()):
-            if seq < self.next_ack:
-                continue
+        seq = self.next_ack
+        pkt_info = self.sent_packets.get(seq, None)
+        if pkt_info is not None:
             if now - pkt_info["send_time"] > pkt_info["rto"]:
-                sys.stderr.write("Timeout Retransmit seq =%d ,rto =%d\n" %(seq, pkt_info["rto"]))
+                sys.stderr.write("Timeout Retransmit seq =%d ,rto =%d,self.rto=%d\n" %(seq, pkt_info["rto"],self.rto))
                 self.sock.sendto(pkt_info["data"], self.peer_addr)
                 self.sent_packets[seq]["send_time"] = now
 
                 self.retransmit_flags[seq] = True
-                self.rto_recovery = True
+                self.rto_recovery[seq] = True
 
                 self.rto = min(2*self.rto, MAX_RTO)
+        # for seq, pkt_info in list(self.sent_packets.items()):
+        #     if seq < self.next_ack:
+        #         continue
+        #     if now - pkt_info["send_time"] > pkt_info["rto"]:
+        #         sys.stderr.write("Timeout Retransmit seq =%d ,rto =%d\n" %(seq, pkt_info["rto"]))
+        #         self.sock.sendto(pkt_info["data"], self.peer_addr)
+        #         self.sent_packets[seq]["send_time"] = now
+
+        #         self.retransmit_flags[seq] = True
+        #         self.rto_recovery[seq] = True
+
+        #         self.rto = min(2*self.rto, MAX_RTO)
 
     def step(self, current_state, duration):
         state = np.roll(self.state, -1, axis=1)
