@@ -1,0 +1,249 @@
+下面给出三个独立文件：
+
+⸻
+
+1. packet_sim.py
+
+定义一个模拟数据包类，用于记录包的发送和接收信息，并生成可写入日志的字典。
+
+# packet_sim.py
+
+class SimPacket:
+    """
+    模拟数据包，记录：
+      - seq: 包序号
+      - send_ts: 发送时间（ms）
+      - size_bits: 发送比特数
+      - recv_ts: 接收端接收时间（ms）
+      - ack_send_ts: 接收端发 ACK 的时间（ms）
+      - ack_recv_ts: 发送端收到 ACK 的时间（ms）
+    """
+    def __init__(self, seq: int, send_ts: int, size_bits: int):
+        self.seq = seq
+        self.send_ts = send_ts
+        self.size_bits = size_bits
+        self.recv_ts = None
+        self.ack_send_ts = None
+        self.ack_recv_ts = None
+
+    def to_dict(self):
+        return {
+            'seq': self.seq,
+            'send_ts': self.send_ts,
+            'size_bits': self.size_bits,
+            'recv_ts': self.recv_ts,
+            'ack_send_ts': self.ack_send_ts,
+            'ack_recv_ts': self.ack_recv_ts,
+        }
+
+
+⸻
+
+2. cubic_sender.py
+
+基于前面的 Cubic 仿真框架，加入 SimPacket 和 CSV 日志：
+
+# cubic_sender.py
+
+import math
+import heapq
+import random
+import csv
+from packet_sim import SimPacket
+from cubic_receiver import CubicReceiver
+
+# 仿真参数
+SIM_DURATION = 5000  # ms
+RTT_MIN = 100        # ms
+RTT_JITTER = 20
+LOSS_RATE = 0.05
+
+# Cubic 参数
+C = 0.4
+BETA = 0.7
+
+# 全局事件队列 & 时间
+event_queue = []
+current_time = 0
+
+def schedule(delay_ms, callback, *args):
+    """将事件安排到全局队列"""
+    heapq.heappush(event_queue, (current_time + delay_ms, callback, args))
+
+class CubicSender:
+    def __init__(self, receiver: CubicReceiver):
+        self.receiver = receiver
+        self.seq = 0
+        self.cwnd = 2.0
+        self.inflight = {}      # seq -> SimPacket
+        self.epoch_start = None
+        self.W_last_max = 0.0
+        self.K = 0
+        self.srtt = None
+        self.rttvar = None
+        self.RTO = 300         # 初始 RTO
+        self.next_send_interval = 50  # ms
+
+        # 日志文件
+        self.logfile = open('packet_log.csv', 'w', newline='')
+        fieldnames = ['seq','send_ts','size_bits','recv_ts','ack_send_ts','ack_recv_ts']
+        self.logwriter = csv.DictWriter(self.logfile, fieldnames=fieldnames)
+        self.logwriter.writeheader()
+
+    def cubic_update(self):
+        """根据 CUBIC 公式更新 cwnd"""
+        if self.epoch_start is None:
+            self.epoch_start = current_time
+            self.K = ((self.W_last_max * (1 - BETA)) / C) ** (1.0 / 3)
+        t = (current_time - self.epoch_start) / 1000.0  # 秒
+        cwnd_cubic = C * ((t - self.K) ** 3) + self.W_last_max
+        self.cwnd = max(cwnd_cubic, 1.0)
+
+    def send(self):
+        """尝试发送尽可能多的数据包（受 cwnd 限制）"""
+        while len(self.inflight) < int(self.cwnd):
+            seq = self.seq
+            send_ts = current_time
+            size_bits = 1500 * 8  # 假设每包 1500 字节
+            packet = SimPacket(seq, send_ts, size_bits)
+            self.inflight[seq] = packet
+
+            print(f"[{current_time} ms] Send pkt {seq}, cwnd={self.cwnd:.2f}")
+
+            # 模拟网络延迟与丢包
+            if random.random() > LOSS_RATE:
+                one_way = RTT_MIN/2 + random.randint(-RTT_JITTER, RTT_JITTER)
+                schedule(one_way, self.receiver.receive, seq, send_ts, self)
+
+            # 安排超时重传
+            schedule(self.RTO, self.timeout, seq)
+
+            self.seq += 1
+
+        # 下次触发 send
+        schedule(self.next_send_interval, self.send)
+
+    def timeout(self, seq):
+        """超时重传处理"""
+        if seq in self.inflight:
+            print(f"[{current_time} ms] Timeout pkt {seq}, RTO={self.RTO} ms")
+            # 拥塞窗口回退
+            self.W_last_max = self.cwnd
+            self.cwnd = 1.0
+            self.epoch_start = None
+            # 重发同一包
+            send_ts = current_time
+            packet = self.inflight[seq]
+            packet.send_ts = send_ts
+
+            if random.random() > LOSS_RATE:
+                one_way = RTT_MIN/2 + random.randint(-RTT_JITTER, RTT_JITTER)
+                schedule(one_way, self.receiver.receive, seq, send_ts, self)
+            # 重置定时器
+            schedule(self.RTO, self.timeout, seq)
+
+    def ack(self, ack_seq, original_send_ts):
+        """收到 ACK 回调"""
+        if ack_seq not in self.inflight:
+            return
+        packet = self.inflight[ack_seq]
+        # 记录接收端 ACK 发出时刻
+        packet.ack_send_ts = current_time
+        # 记录发送端收到 ACK 的时刻
+        packet.ack_recv_ts = current_time
+        # 记录接收端 receive 时间（approx）
+        packet.recv_ts = packet.ack_send_ts - (packet.send_ts - packet.send_ts)/2
+
+        # 计算 RTT
+        rtt = current_time - packet.send_ts
+        print(f"[{current_time} ms] ACK {ack_seq} | RTT={rtt} ms")
+
+        # 更新 RTO（RFC6298）
+        if self.srtt is None:
+            self.srtt = rtt
+            self.rttvar = rtt / 2
+        else:
+            self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - rtt)
+            self.srtt = 0.875 * self.srtt + 0.125 * rtt
+        self.RTO = max(int(self.srtt + 4 * self.rttvar), 100)
+
+        # 日志写入
+        self.logwriter.writerow(packet.to_dict())
+        self.logfile.flush()
+
+        # 清理
+        del self.inflight[ack_seq]
+
+        # 更新 cwnd
+        self.cubic_update()
+
+class CubicSim:
+    def __init__(self):
+        self.receiver = None
+        self.sender = None
+
+    def run(self):
+        global current_time
+        while event_queue and current_time < SIM_DURATION:
+            current_time, callback, args = heapq.heappop(event_queue)
+            callback(*args)
+        # 关闭日志
+        self.sender.logfile.close()
+
+if __name__ == "__main__":
+    sim = CubicSim()
+    sim.receiver = CubicReceiver()
+    sim.sender = CubicSender(sim.receiver)
+    sim.receiver.set_sender(sim.sender)
+
+    # 启动仿真
+    schedule(0, sim.sender.send)
+    sim.run()
+
+
+⸻
+
+3. cubic_receiver.py
+
+接收端与之前保持一致，只是调用 ACK 时直接触发发送端的 ack 方法：
+
+# cubic_receiver.py
+
+import heapq
+import random
+
+# 从 sender 中共享全局队列和时间
+from cubic_sender import event_queue, current_time, schedule
+
+RTT_MIN = 100
+RTT_JITTER = 20
+
+class CubicReceiver:
+    def __init__(self):
+        self.expected = 0
+        self.sender = None
+
+    def set_sender(self, sender):
+        self.sender = sender
+
+    def receive(self, seq, send_ts, sender):
+        """模拟接收数据包后，按序处理并生成 ACK"""
+        print(f"[{current_time} ms] Receiver got pkt {seq}")
+        # ACK 延迟
+        ack_delay = RTT_MIN/2 + random.randint(-RTT_JITTER, RTT_JITTER)
+        # 调度发送端的 ack 回调
+        schedule(ack_delay, sender.ack, seq, send_ts)
+
+
+⸻
+
+运行方式
+
+python3 cubic_sender.py
+
+	•	仿真总时长 5000 ms
+	•	输出包的发送、超时、ACK 和 RTT 信息
+	•	运行结束后，会在当前目录生成 packet_log.csv，字段包括：
+seq,send_ts,size_bits,recv_ts,ack_send_ts,ack_recv_ts
+
+这样，你就得到了一个基于 Pantheon 思路的纯 Python Cubic 仿真环境，并带有详细的 数据包日志。
