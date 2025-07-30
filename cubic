@@ -44,7 +44,144 @@ class SimPacket:
 基于前面的 Cubic 仿真框架，加入 SimPacket 和 CSV 日志：
 
 # cubic_sender.py
+from __future__ import print_function, division
+import random, csv
+import heapq
 
+import sim_env                         # <— 新增
+from packet_sim import SimPacket
+from cubic_receiver import CubicReceiver
+
+# 仿真参数
+SIM_DURATION = 5000   # ms
+RTT_MIN      = 100    # ms
+RTT_JITTER   = 20
+LOSS_RATE    = 0.05
+
+# Cubic 参数
+C    = 0.4
+BETA = 0.7
+
+class CubicSender(object):
+    def __init__(self, receiver):
+        self.receiver   = receiver
+        self.seq        = 0
+        self.cwnd       = 2.0
+        self.inflight   = {}      # seq -> SimPacket
+        self.epoch_start= None
+        self.W_last_max = 0.0
+        self.K          = 0
+        self.srtt       = None
+        self.rttvar     = None
+        self.RTO        = 300     # 初始 RTO (ms)
+        self.send_intvl = 50      # ms
+
+        # 日志文件（Python2 下用二进制模式）
+        self.logfile = open('packet_log.csv', 'wb')
+        fieldnames = ['seq','send_ts','size_bits','recv_ts','ack_send_ts','ack_recv_ts']
+        self.logwriter = csv.DictWriter(self.logfile, fieldnames=fieldnames)
+        self.logwriter.writeheader()
+
+    def cubic_update(self):
+        if self.epoch_start is None:
+            self.epoch_start = sim_env.current_time
+            self.K = ((self.W_last_max * (1 - BETA)) / C) ** (1.0/3)
+        t = (sim_env.current_time - self.epoch_start) / 1000.0
+        cwnd_cubic = C * ((t - self.K) ** 3) + self.W_last_max
+        self.cwnd = max(cwnd_cubic, 1.0)
+
+    def send(self):
+        # 发送尽可能多的包，直到 inflight 达到 cwnd
+        while len(self.inflight) < int(self.cwnd):
+            seq     = self.seq
+            send_ts = sim_env.current_time
+            size_bits = 1500 * 8
+            pkt = SimPacket(seq, send_ts, size_bits)
+            self.inflight[seq] = pkt
+
+            print("[{} ms] Send pkt {}, cwnd={:.2f}".format(
+                sim_env.current_time, seq, self.cwnd))
+
+            # 模拟丢包 + 延迟
+            if random.random() > LOSS_RATE:
+                one_way = RTT_MIN/2 + random.randint(-RTT_JITTER, RTT_JITTER)
+                sim_env.schedule(one_way, self.receiver.receive,
+                                 seq, send_ts, self)
+
+            # 安排超时重传
+            sim_env.schedule(self.RTO, self.timeout, seq)
+            self.seq += 1
+
+        # 安排下一次 send
+        sim_env.schedule(self.send_intvl, self.send)
+
+    def timeout(self, seq):
+        if seq in self.inflight:
+            print("[{} ms] Timeout pkt {}, RTO={} ms".format(
+                sim_env.current_time, seq, self.RTO))
+            # 拥塞窗口回退
+            self.W_last_max  = self.cwnd
+            self.cwnd        = 1.0
+            self.epoch_start = None
+            # 重发同一包
+            pkt = self.inflight[seq]
+            pkt.send_ts = sim_env.current_time
+            if random.random() > LOSS_RATE:
+                one_way = RTT_MIN/2 + random.randint(-RTT_JITTER, RTT_JITTER)
+                sim_env.schedule(one_way, self.receiver.receive,
+                                 seq, pkt.send_ts, self)
+            # 重置超时定时器
+            sim_env.schedule(self.RTO, self.timeout, seq)
+
+    def ack(self, ack_seq, orig_send_ts):
+        if ack_seq not in self.inflight:
+            return
+        pkt = self.inflight.pop(ack_seq)
+        # 记录接收端 ACK 发出和收到时刻，及 approximate recv time
+        pkt.ack_send_ts = sim_env.current_time
+        pkt.ack_recv_ts = sim_env.current_time
+        pkt.recv_ts     = pkt.send_ts + (pkt.ack_send_ts - pkt.send_ts)/2
+
+        # 计算 RTT 并更新 RTO (RFC6298)
+        rtt = sim_env.current_time - pkt.send_ts
+        print("[{} ms] ACK {} | RTT={} ms".format(
+            sim_env.current_time, ack_seq, rtt))
+        if self.srtt is None:
+            self.srtt   = rtt
+            self.rttvar = rtt/2
+        else:
+            self.rttvar = 0.75*self.rttvar + 0.25*abs(self.srtt-rtt)
+            self.srtt   = 0.875*self.srtt + 0.125*rtt
+        self.RTO = max(int(self.srtt + 4*self.rttvar), 100)
+
+        # 写日志
+        self.logwriter.writerow(pkt.to_dict()); self.logfile.flush()
+
+        # 更新 cwnd
+        self.cubic_update()
+
+class CubicSim(object):
+    def __init__(self):
+        self.receiver = None
+        self.sender   = None
+
+    def run(self):
+        # 主循环，从 sim_env.event_queue 拉事件
+        while sim_env.event_queue and sim_env.current_time < SIM_DURATION:
+            t, cb, args = heapq.heappop(sim_env.event_queue)
+            sim_env.current_time = t
+            cb(*args)
+        self.sender.logfile.close()
+
+if __name__ == "__main__":
+    sim = CubicSim()
+    sim.receiver = CubicReceiver()
+    sim.sender   = CubicSender(sim.receiver)
+    sim.receiver.set_sender(sim.sender)
+
+    # 启动仿真
+    sim_env.schedule(0, sim.sender.send)
+    sim.run()
 import math
 import heapq
 import random
