@@ -1,0 +1,374 @@
+# -*- coding: utf-8 -*-
+# Python 2.7 compatible simulated sender/receiver over a Mahimahi-like link
+
+import heapq
+import random
+
+# ========== 简单数据对象（Python 2.7 风格） ==========
+
+class Packet(object):
+    def __init__(self, seq, size_bytes, send_ts_ms, tx_id):
+        self.seq = seq
+        self.size_bytes = size_bytes
+        self.send_ts_ms = send_ts_ms
+        self.tx_id = tx_id
+
+class Ack(object):
+    def __init__(self, ack_seq, echo_send_ts_ms, pkt_seq_justified):
+        self.ack_seq = ack_seq
+        self.echo_send_ts_ms = echo_send_ts_ms
+        self.pkt_seq_justified = pkt_seq_justified
+
+# ========== Mahimahi 风格单向链路 ==========
+
+class OneWayLink(object):
+    def __init__(self, rate_mbps, prop_ms, queue_pkts, loss_prob, rng):
+        self.rate_mbps = float(rate_mbps)
+        self.prop_ms = int(prop_ms)
+        self.queue_pkts = int(queue_pkts)
+        self.loss_prob = float(loss_prob)
+        self.rng = rng
+        self.next_dequeue_ready_ms = 0  # 串行化“可用时间”
+
+        # 统计
+        self.enq_drop = 0
+        self.rand_drop = 0
+        self.enq_cnt = 0
+
+    def serialization_ms(self, size_bytes):
+        # 速率 Mbps -> 每毫秒 bit 能力：rate_mbps * 1e6 / 1000 = rate_mbps * 1000 bits/ms
+        bits = int(size_bytes) * 8.0
+        ms = int((bits / (self.rate_mbps * 1000000.0)) * 1000.0 + 0.999)  # ceiling
+        if ms < 1:
+            ms = 1
+        return ms
+
+    def send(self, sim, now_ms, direction, item):
+        """
+        direction: 'to_receiver' or 'to_sender'
+        item: { 'type': 'data'|'ack', 'obj': Packet|Ack, 'size': int (for ack) }
+        """
+        self.enq_cnt += 1
+
+        # 使用 in-flight 统计近似队列容量
+        in_flight = sim.link_inflight_count[direction]
+        if in_flight >= self.queue_pkts:
+            self.enq_drop += 1
+            return  # 队列溢出
+
+        # 随机丢包
+        if self.rng.random() < self.loss_prob:
+            self.rand_drop += 1
+            return
+
+        # 串行化 + 传播
+        if item['type'] == 'data':
+            size_b = item['obj'].size_bytes
+        else:
+            size_b = item.get('size', 60)
+        ser_ms = self.serialization_ms(size_b)
+        depart_ms = max(self.next_dequeue_ready_ms, now_ms) + ser_ms
+        arrive_ms = depart_ms + self.prop_ms
+        self.next_dequeue_ready_ms = depart_ms
+
+        # in-flight 计数
+        sim.link_inflight_count[direction] += 1
+
+        sim.schedule(arrive_ms, direction, item)
+
+# ========== 离散事件模拟器 ==========
+
+class Simulator(object):
+    def __init__(self, seed=0):
+        self.time_ms = 0
+        self._eid = 0
+        self.pq = []  # heap of (time_ms, eid, kind, payload)
+        self.rng = random.Random(seed)
+        self.link_fwd = None
+        self.link_rev = None
+        self.link_inflight_count = {'to_receiver': 0, 'to_sender': 0}
+
+    def set_links(self, link_fwd, link_rev):
+        self.link_fwd = link_fwd
+        self.link_rev = link_rev
+
+    def schedule(self, time_ms, kind, payload):
+        self._eid += 1
+        heapq.heappush(self.pq, (int(time_ms), int(self._eid), kind, payload))
+
+    def run(self, until_ms, step_cb=None):
+        until_ms = int(until_ms)
+        while self.pq and self.time_ms <= until_ms:
+            time_ms, eid, kind, payload = heapq.heappop(self.pq)
+            self.time_ms = time_ms
+
+            # 入站事件：减少 in-flight
+            if kind == 'to_receiver' or kind == 'to_sender':
+                self.link_inflight_count[kind] = max(0, self.link_inflight_count[kind] - 1)
+
+            if step_cb is not None:
+                ev = {'time_ms': time_ms, 'kind': kind, 'payload': payload}
+                step_cb(ev)
+
+# ========== 接收端：累计 ACK + 乱序缓存 + 重复 ACK ==========
+
+class Receiver(object):
+    def __init__(self):
+        self.last_inorder = -1
+        self.buffer = {}  # seq -> Packet
+        self.rcvd = 0
+
+    def on_packet(self, pkt):
+        self.rcvd += 1
+        if pkt.seq <= self.last_inorder:
+            # 旧包：重复 ACK
+            return self._make_ack(pkt.send_ts_ms, self.last_inorder)
+
+        self.buffer[pkt.seq] = pkt
+
+        advanced = False
+        # 尝试推进按序
+        while (self.last_inorder + 1) in self.buffer:
+            advanced = True
+            self.last_inorder += 1
+            self.buffer.pop(self.last_inorder, None)
+
+        # RTT 回显时间的简化选择
+        if self.last_inorder in self.buffer:
+            echo_ts = self.buffer[self.last_inorder].send_ts_ms
+        else:
+            echo_ts = pkt.send_ts_ms
+
+        return self._make_ack(echo_ts, self.last_inorder)
+
+    def _make_ack(self, echo_send_ts_ms, pkt_seq_justified):
+        return Ack(self.last_inorder, echo_send_ts_ms, pkt_seq_justified)
+
+# ========== 发送端：dupACK 快速重传 + RTO 超时重传 + AIMD ==========
+
+class Sender(object):
+    def __init__(self, sim, fwd, rev, mss=1400, init_cwnd=2.0, init_ssthresh=64.0):
+        self.sim = sim
+        self.link_fwd = fwd
+        self.link_rev = rev
+        self.mss = int(mss)
+
+        self.cwnd = float(init_cwnd)
+        self.ssthresh = float(init_ssthresh)
+        self.next_seq = 0
+        self.next_ack = 0
+
+        # sent: seq -> {'pkt': Packet, 'send_ms': int, 'tx_id': int, 'rto_ms': int}
+        self.sent = {}
+        self.tx_id_counter = 0
+
+        # RTT/RTO（Karn）
+        self.srtt = None
+        self.rttvar = None
+        self.rto_ms = 1000  # 初始 RTO 1s
+
+        # dupACK
+        self.last_ack_seen = -1
+        self.dup_ack_cnt = 0
+
+        # 统计
+        self.retx_fast = 0
+        self.retx_to = 0
+        self.bytes_sent = 0
+        self.acks_rcvd = 0
+
+        # 周期驱动
+        self.sim.schedule(0, 'sender_tick', {})
+
+    def in_flight(self):
+        return self.next_seq - self.next_ack
+
+    def window_open(self):
+        return self.in_flight() < int(self.cwnd)
+
+    def maybe_send(self):
+        while self.window_open():
+            self.send_one()
+
+    def send_one(self, is_retx=False, seq_override=None):
+        if seq_override is not None:
+            seq = int(seq_override)
+        else:
+            seq = self.next_seq
+        self.tx_id_counter += 1
+        pkt = Packet(seq, self.mss, self.sim.time_ms, self.tx_id_counter)
+
+        self.sent[seq] = {
+            'pkt': pkt,
+            'send_ms': self.sim.time_ms,
+            'tx_id': self.tx_id_counter,
+            'rto_ms': self.rto_ms
+        }
+        self.bytes_sent += self.mss
+
+        # 通过前向链路发往接收端
+        item = {'type': 'data', 'obj': pkt}
+        self.link_fwd.send(self.sim, self.sim.time_ms, 'to_receiver', item)
+
+        if seq_override is None:
+            self.next_seq += 1
+
+    def on_ack(self, ack):
+        self.acks_rcvd += 1
+        ackno = ack.ack_seq
+
+        # dupACK 统计
+        if ackno == self.last_ack_seen:
+            self.dup_ack_cnt += 1
+        else:
+            self.last_ack_seen = ackno
+            self.dup_ack_cnt = 1
+
+        # 过时 ACK
+        if ackno < self.next_ack:
+            return
+
+        # 累计 ACK 前进
+        if ackno >= self.next_ack:
+            s = self.next_ack
+            while s <= ackno:
+                info = self.sent.get(s)
+                if info is not None:
+                    # Karn：仅用首发样本更新 RTT，并匹配回显发送时间
+                    if info['pkt'].tx_id == 1 and ack.echo_send_ts_ms == info['pkt'].send_ts_ms:
+                        rtt = self.sim.time_ms - info['send_ms']
+                        self._update_rto(rtt)
+                    self.sent.pop(s, None)
+                s += 1
+
+            self.next_ack = ackno + 1
+
+            # 拥塞控制：慢启动/加性增
+            if self.cwnd < self.ssthresh:
+                self.cwnd += 1.0
+            else:
+                # 近似每个 ACK 增 1/cwnd
+                self.cwnd += 1.0 / max(1.0, self.cwnd)
+
+            # 重置 dup 计数并继续发
+            self.dup_ack_cnt = 0
+            self.maybe_send()
+            return
+
+        # 未前进：dupACK
+        if self.dup_ack_cnt == 3:
+            # 快速重传 next_ack
+            self.ssthresh = max(2.0, self.cwnd / 2.0)
+            self.cwnd = max(2.0, self.ssthresh + 3.0)  # fast recovery 近似
+            self.retx_fast += 1
+            self.send_one(is_retx=True, seq_override=self.next_ack)
+
+    def _update_rto(self, rtt_ms):
+        rtt_ms = float(rtt_ms)
+        if self.srtt is None:
+            self.srtt = rtt_ms
+            self.rttvar = self.srtt / 2.0
+        else:
+            self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - rtt_ms)
+            self.srtt = 0.875 * self.srtt + 0.125 * rtt_ms
+        self.rto_ms = int(max(self.srtt + 4.0 * self.rttvar + 0.5, 100.0))
+
+    def on_timeout_check(self):
+        # 只检查最老未确认包
+        if self.next_ack < self.next_seq:
+            info = self.sent.get(self.next_ack)
+            if info is not None and (self.sim.time_ms - info['send_ms'] > info['rto_ms']):
+                # 超时 -> 乘性减
+                self.ssthresh = max(2.0, self.cwnd / 2.0)
+                self.cwnd = 1.0
+                self.retx_to += 1
+                # 指数退避
+                self.rto_ms = min(self.rto_ms * 2, 60000)
+                # 重传
+                self.send_one(is_retx=True, seq_override=self.next_ack)
+
+    def on_tick(self):
+        self.on_timeout_check()
+        self.maybe_send()
+        # 下一个 tick
+        self.sim.schedule(self.sim.time_ms + 10, 'sender_tick', {})
+
+# ========== 组网 & 运行 ==========
+
+def build_sim(seed=42,
+              rate_fwd_mbps=5.0, rate_rev_mbps=5.0,
+              prop_ms_oneway=25,
+              queue_pkts=100,
+              loss_data=0.02, loss_ack=0.0,
+              mss=1200,
+              target_pkts=2000,
+              sim_end_ms=120000):
+
+    sim = Simulator(seed=seed)
+    link_fwd = OneWayLink(rate_fwd_mbps, prop_ms_oneway, queue_pkts, loss_data, sim.rng)
+    link_rev = OneWayLink(rate_rev_mbps, prop_ms_oneway, queue_pkts, loss_ack, sim.rng)
+    sim.set_links(link_fwd, link_rev)
+
+    sender = Sender(sim, link_fwd, link_rev, mss=mss)
+    receiver = Receiver()
+
+    def step_cb(ev):
+        kind = ev['kind']
+        if kind == 'sender_tick':
+            sender.on_tick()
+
+        elif kind == 'to_receiver':
+            item = ev['payload']
+            if item['type'] == 'data':
+                pkt = item['obj']
+                ack = receiver.on_packet(pkt)
+                # 回 ACK
+                ack_size = 60
+                sim.link_rev.send(sim, sim.time_ms, 'to_sender', {'type': 'ack', 'obj': ack, 'size': ack_size})
+
+        elif kind == 'to_sender':
+            item = ev['payload']
+            if item['type'] == 'ack':
+                ack = item['obj']
+                sender.on_ack(ack)
+
+    # 初始尝试发包
+    sender.maybe_send()
+    sim.run(sim_end_ms, step_cb=step_cb)
+
+    # 统计
+    total_delivered_pkts = receiver.last_inorder + 1
+    dur_s = max(sim.time_ms, 1) / 1000.0
+    thr_mbps = (total_delivered_pkts * mss * 8.0) / 1000000.0 / dur_s
+
+    stats = {
+        'sim_time_ms': sim.time_ms,
+        'delivered_pkts': total_delivered_pkts,
+        'sender_bytes_sent': sender.bytes_sent,
+        'throughput_Mbps': round(thr_mbps, 3),
+        'retx_fast': sender.retx_fast,
+        'retx_timeout': sender.retx_to,
+        'cwnd_final': round(sender.cwnd, 2),
+        'ssthresh_final': round(sender.ssthresh, 2),
+        'link_fwd_enq': sim.link_fwd.enq_cnt,
+        'link_fwd_qdrop': sim.link_fwd.enq_drop,
+        'link_fwd_randdrop': sim.link_fwd.rand_drop,
+    }
+    return stats
+
+if __name__ == '__main__':
+    stats = build_sim(
+        seed=2025,
+        rate_fwd_mbps=8.0,
+        rate_rev_mbps=8.0,
+        prop_ms_oneway=30,
+        queue_pkts=200,
+        loss_data=0.03,
+        loss_ack=0.0,
+        mss=1200,
+        target_pkts=2000,
+        sim_end_ms=120000
+    )
+    print('=== SIM DONE ===')
+    for k in sorted(stats.keys()):
+        print('%s: %s' % (k, stats[k]))
