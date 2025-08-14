@@ -1,0 +1,112 @@
+# -*- coding: utf-8 -*-
+# Python 2.7
+# 链路与离散事件调度器；同时定义 Data/Ack 以便 sender/receiver 共享
+
+import heapq
+import random
+
+class Data(object):
+    # 对齐你原先的 Data 字段：seq_num, send_ts, sent_bytes, delivered_time, delivered, payload
+    def __init__(self, seq_num, send_ts, sent_bytes, delivered_time, delivered, payload=""):
+        self.seq_num = int(seq_num)
+        self.send_ts = int(send_ts)
+        self.sent_bytes = int(sent_bytes)
+        self.delivered_time = int(delivered_time)
+        self.delivered = int(delivered)
+        self.payload = payload  # 这里不做真实数据
+
+class Ack(object):
+    # 对齐你原先的 Ack 字段：seq_num, send_ts, sent_bytes, delivered_time, delivered, ack_bytes
+    def __init__(self, seq_num, send_ts, sent_bytes, delivered_time, delivered, ack_bytes):
+        self.seq_num = int(seq_num)
+        self.send_ts = int(send_ts)  # 回显用于 RTT 估计的发送时间
+        self.sent_bytes = int(sent_bytes)
+        self.delivered_time = int(delivered_time)
+        self.delivered = int(delivered)
+        self.ack_bytes = int(ack_bytes)
+
+class OneWayLink(object):
+    """
+    Mahimahi 风格单向链路：
+      - 串行化：根据 rate_mbps 和数据大小计算耗时
+      - 传播时延：prop_ms
+      - 队列：queue_pkts（近似，以 in-flight 数量限制）
+      - 随机丢包：loss_prob
+    """
+    def __init__(self, rate_mbps, prop_ms, queue_pkts, loss_prob, rng):
+        self.rate_mbps = float(rate_mbps)
+        self.prop_ms = int(prop_ms)
+        self.queue_pkts = int(queue_pkts)
+        self.loss_prob = float(loss_prob)
+        self.rng = rng
+
+        self.next_dequeue_ready_ms = 0
+        self.enq_cnt = 0
+        self.enq_drop = 0
+        self.rand_drop = 0
+
+    def _serialization_ms(self, size_bytes):
+        bits = float(size_bytes) * 8.0
+        ms = int((bits / (self.rate_mbps * 1000000.0)) * 1000.0 + 0.999)
+        if ms < 1:
+            ms = 1
+        return ms
+
+    def send(self, sim, now_ms, direction, item_type, obj, approx_ack_size=60):
+        """
+        direction: 'to_receiver' | 'to_sender'
+        item_type: 'data' | 'ack'
+        obj: Data | Ack
+        """
+        self.enq_cnt += 1
+
+        in_flight = sim.link_inflight_count[direction]
+        if in_flight >= self.queue_pkts:
+            self.enq_drop += 1
+            return
+
+        if self.rng.random() < self.loss_prob:
+            self.rand_drop += 1
+            return
+
+        if item_type == 'data':
+            size_b = getattr(obj, 'sent_bytes', 1200)
+        else:
+            size_b = approx_ack_size
+
+        ser_ms = self._serialization_ms(size_b)
+        depart_ms = max(self.next_dequeue_ready_ms, now_ms) + ser_ms
+        arrive_ms = depart_ms + self.prop_ms
+        self.next_dequeue_ready_ms = depart_ms
+
+        sim.link_inflight_count[direction] += 1
+        sim.schedule(arrive_ms, direction, {'type': item_type, 'obj': obj, 'size': size_b})
+
+class Simulator(object):
+    def __init__(self, seed=0):
+        self.time_ms = 0
+        self._eid = 0
+        self.pq = []  # (time_ms, eid, kind, payload)
+        self.rng = random.Random(seed)
+        self.link_fwd = None
+        self.link_rev = None
+        self.link_inflight_count = {'to_receiver': 0, 'to_sender': 0}
+
+    def set_links(self, link_fwd, link_rev):
+        self.link_fwd = link_fwd
+        self.link_rev = link_rev
+
+    def schedule(self, time_ms, kind, payload):
+        self._eid += 1
+        heapq.heappush(self.pq, (int(time_ms), int(self._eid), kind, payload))
+
+    def run(self, until_ms, step_cb):
+        until_ms = int(until_ms)
+        while self.pq and self.time_ms <= until_ms:
+            time_ms, eid, kind, payload = heapq.heappop(self.pq)
+            self.time_ms = time_ms
+
+            if kind in ('to_receiver', 'to_sender'):
+                self.link_inflight_count[kind] = max(0, self.link_inflight_count[kind] - 1)
+
+            step_cb({'time_ms': time_ms, 'kind': kind, 'payload': payload})
