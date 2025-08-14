@@ -1,0 +1,63 @@
+# -*- coding: utf-8 -*-
+# Python 2.7
+from link import Simulator, OneWayLink
+from sender import VideoSender
+from receiver import Receiver
+
+def main():
+    # 1) 构建模拟器与链路（不改变 Mahimahi 风格逻辑）
+    sim = Simulator(seed=2025)
+    link_fwd = OneWayLink(rate_mbps=8.0, prop_ms=30, queue_pkts=200, loss_prob=0.03, rng=sim.rng)  # 数据方向
+    link_rev = OneWayLink(rate_mbps=8.0, prop_ms=30, queue_pkts=200, loss_prob=0.00, rng=sim.rng)  # ACK 方向
+    sim.set_links(link_fwd, link_rev)
+
+    # 2) 构建发送端/接收端（变量名对齐你的代码）
+    sender = VideoSender(sim, link_fwd, link_rev, mss=1200)
+    receiver = Receiver()
+
+    # 3) 事件回调：把链路的到达事件“交给”发送端/接收端处理
+    def step_cb(ev):
+        kind = ev['kind']
+        if kind == 'sender_tick':
+            sender.on_tick()
+
+        elif kind == 'to_receiver':
+            item = ev['payload']
+            if item['type'] == 'data':
+                ack = receiver.on_data(item['obj'])
+                # 回 ACK
+                sim.link_rev.send(sim, sim.time_ms, 'to_sender', 'ack', ack, approx_ack_size=60)
+
+        elif kind == 'to_sender':
+            item = ev['payload']
+            if item['type'] == 'ack':
+                ack = item['obj']
+                # 可选：打印 ACK 轨迹（注意 Python 2.7 的 %s）
+                # info = sender.sent_packets.get(ack.seq_num)
+                # rtt = (sim.time_ms - info['send_time']) if info else None
+                # print("[ACK] t=%sms ack=%s cwnd=%.2f rto=%s rtt=%s" %
+                #       (str(sim.time_ms), str(ack.seq_num), sender.cwnd, str(sender.rto),
+                #        ("%.1f" % rtt if rtt is not None else "NA")))
+                sender.update_state(ack)
+
+    # 4) 启动：发初始数据 & 跑模拟
+    sender.maybe_fill_window()
+    sim.run(until_ms=120000, step_cb=step_cb)
+
+    # 5) 统计
+    total_delivered = receiver.last_seq_num + 1
+    dur_s = max(sim.time_ms, 1) / 1000.0
+    throughput_mbps = (total_delivered * 1200 * 8.0) / 1000000.0 / dur_s
+
+    print("=== SIM DONE ===")
+    print("sim_time_ms: %s" % sim.time_ms)
+    print("delivered_pkts: %s" % total_delivered)
+    print("throughput_Mbps: %.3f" % throughput_mbps)
+    print("cwnd_final: %.2f" % sender.cwnd)
+    print("ssthresh_final: %.2f" % sender.ssthresh)
+    print("link_fwd_enq: %s" % sim.link_fwd.enq_cnt)
+    print("link_fwd_qdrop: %s" % sim.link_fwd.enq_drop)
+    print("link_fwd_randdrop: %s" % sim.link_fwd.rand_drop)
+
+if __name__ == '__main__':
+    main()
