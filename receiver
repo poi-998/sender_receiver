@@ -1,32 +1,32 @@
 # -*- coding: utf-8 -*-
 # Python 2.7
-# 接收端逻辑：变量与流程尽量对齐你原始 Receiver
+# Receiver logic: variables and process aligned with original Receiver
 
 from link import Ack
 
 class Receiver(object):
     def __init__(self):
-        self.last_seq_num = -1           # 对齐：已按序收到的最大序号
-        self.received_packets = {}       # 对齐：乱序缓冲 seq -> {Data 简化}
-        self.window_size = 100           # 保留但本模拟不强制使用
-        self.ack_count = 0               # 对齐：重复 ACK 计数
-        self.sent_ack = -1               # 对齐：上次发送的 ACK 序号
+        self.last_seq_num = -1           # largest in-order received sequence
+        self.received_packets = {}       # out-of-order buffer: seq -> {Data info}
+        self.window_size = 100           # kept but not enforced in this simulation
+        self.ack_count = 0               # duplicate ACK counter
+        self.sent_ack = -1               # last ACKed sequence
 
     def on_data(self, data_pkt):
         """
-        输入:link.Data
-        输出:link.Ack
+        Input: link.Data
+        Output: link.Ack
         """
         seq = data_pkt.seq_num
 
         if seq <= self.last_seq_num:
-            # 旧包：重复 ACK
+            # Old packet: duplicate ACK
             ack = self._make_ack(self.last_seq_num, data_pkt)
             self.ack_count += 1
             self.sent_ack = ack.seq_num
             return ack
 
-        # 缓存
+        # Buffer it
         self.received_packets[seq] = {
             'send_ts': data_pkt.send_ts,
             'sent_bytes': data_pkt.sent_bytes,
@@ -34,14 +34,14 @@ class Receiver(object):
             'delivered': data_pkt.delivered
         }
 
-        # 尝试推进
+        # Try to advance
         advanced = False
         while (self.last_seq_num + 1) in self.received_packets:
             self.last_seq_num += 1
             self.received_packets.pop(self.last_seq_num, None)
             advanced = True
 
-        # 构造累计 ACK（如果没前进，也是重复 ACK）
+        # Build cumulative ACK (if not advanced, it's duplicate ACK)
         ack = self._make_ack(self.last_seq_num, data_pkt)
         if advanced:
             self.ack_count = 0
@@ -52,11 +52,11 @@ class Receiver(object):
 
     def _make_ack(self, ack_seq, data_pkt):
         """
-        为了与原代码一致,ACK 字段含：
-          - seq_num:累计 ACK 序号
-          - send_ts:回显用于 RTT 的发送时间(近似用当前 data 的 send_ts)
-          - sent_bytes / delivered_time / delivered:沿用 Data 的元信息
-          - ack_bytes:近似用 Data 的长度(或固定 60)
+        To align with original code, ACK includes:
+          - seq_num: cumulative ACK sequence
+          - send_ts: echo send timestamp for RTT (use data's send_ts here)
+          - sent_bytes / delivered_time / delivered: copied from Data
+          - ack_bytes: approx as data length (or fixed 60)
         """
         return Ack(
             seq_num=ack_seq,
@@ -64,5 +64,5 @@ class Receiver(object):
             sent_bytes=data_pkt.sent_bytes,
             delivered_time=data_pkt.delivered_time,
             delivered=data_pkt.delivered,
-            ack_bytes=data_pkt.sent_bytes  # 近似：用 data 大小当作 ack_bytes
+            ack_bytes=data_pkt.sent_bytes  # approx: use data size as ack_bytes
         )
