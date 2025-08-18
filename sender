@@ -1,46 +1,46 @@
 # -*- coding: utf-8 -*-
 # Python 2.7
-# 发送端逻辑（变量/流程尽量对齐你原先的 VideoSender；不使用真实 socket）
+# Sender logic (variables/process aligned with your original VideoSender; no real sockets)
 
 from link import Data
 
 class VideoSender(object):
     def __init__(self, sim, link_fwd, link_rev, mss=1200):
-        # 模拟器与链路
+        # Simulator and links
         self.sim = sim
         self.link_fwd = link_fwd
         self.link_rev = link_rev
 
-        # ===== 与原 VideoSender 对齐的核心状态 =====
-        self.init_ts = 0                           # 起始时间=0（模拟时钟）
-        self.seq_num = 0                           # 下一个要发送的序号
-        self.next_ack = 0                          # 最老未确认序号
-        self.cwnd = 2.0                            # 拥塞窗口
-        self.ssthresh = 64.0                       # 慢启动阈值（新增：便于 AIMD）
-        self.step_len_ms = 100                     # 与原相近，未用于调度，仅占位
+        # ===== Core state aligned with original VideoSender =====
+        self.init_ts = 0                           # start time = 0 (simulated clock)
+        self.seq_num = 0                           # next sequence number to send
+        self.next_ack = 0                          # oldest unacknowledged sequence
+        self.cwnd = 2.0                            # congestion window
+        self.ssthresh = 64.0                       # slow start threshold (added: for AIMD)
+        self.step_len_ms = 100                     # similar to original, placeholder only
 
-        # BBR/Vegas 相关在此简化；保留名字以便你将来接入 RL
+        # BBR/Vegas variables simplified; keep names for possible RL extension
         self.delivered_time = 0
         self.delivered = 0
         self.sent_bytes = 0
 
-        # RTT/RTO（与原名一致）
+        # RTT/RTO (names consistent with original)
         self.srtt = None
         self.rttvar = None
-        self.rto = 1000                            # 初始 RTO 1s
-        self.rto_recovery = {}                     # 标记进入 RTO 恢复阶段的包（名称对齐）
-        self.retransmit_flags = {}                 # 标记重传的包（Karn）
-        self.ack_counts = {}                       # 重复 ACK 计数（key=ack_seq）
-        self.sent_packets = {}                     # 已发送未确认：seq -> {'data':Data,'send_time':ms,'rto':ms}
+        self.rto = 1000                            # initial RTO 1s
+        self.rto_recovery = {}                     # mark packets in RTO recovery
+        self.retransmit_flags = {}                 # mark retransmitted packets (Karn)
+        self.ack_counts = {}                       # duplicate ACK count (key=ack_seq)
+        self.sent_packets = {}                     # sent but unacked: seq -> {'data':Data,'send_time':ms,'rto':ms}
 
-        # 其他
+        # Others
         self.mss = int(mss)
         self.running = True
 
-        # 周期 tick：检查超时、尝试发包
+        # Periodic tick: check timeout and try to send packets
         self.sim.schedule(0, 'sender_tick', {})
 
-    # ===== 时间与窗口 =====
+    # ===== Time and window =====
     def curr_ts_ms(self):
         return int(self.sim.time_ms)
 
@@ -51,7 +51,7 @@ class VideoSender(object):
     def window_is_open(self):
         return self.can_send()
 
-    # ===== 发送 =====
+    # ===== Sending =====
     def send(self):
         if not self.can_send():
             return
@@ -77,50 +77,50 @@ class VideoSender(object):
         while self.window_is_open():
             self.send()
 
-    # ===== ACK 处理（尽量对齐你原逻辑） =====
+    # ===== ACK processing (aligned with original logic) =====
     def update_state(self, ack):
         curr_time_ms = self.curr_ts_ms()
         acked_seq = ack.seq_num
 
         if acked_seq >= self.next_ack:
-            # 正常累计 ACK，推进窗口
+            # Normal cumulative ACK, advance window
             self.next_ack = acked_seq + 1
 
-            # 清理重复 ACK 统计（仅清理已确认及以前）
+            # Clear duplicate ACK counts (for confirmed seq and earlier)
             keys_to_del = [k for k in self.ack_counts if k <= acked_seq]
             for k in keys_to_del:
                 del self.ack_counts[k]
 
-            # 清理已确认的数据包
+            # Clear confirmed packets
             keys_to_del = [k for k in self.sent_packets if k <= acked_seq]
             for k in keys_to_del:
-                # RTT 更新（Karn：首发样本才更新）
+                # RTT update (Karn: only for first transmissions)
                 info = self.sent_packets[k]
                 is_retx = self.retransmit_flags.get(k, False)
                 if (not is_retx) and (ack.send_ts == info['data'].send_ts):
                     rtt = curr_time_ms - info['send_time']
                     self._update_rto(rtt)
-                # 清掉该 seq
+                # Delete this seq
                 del self.sent_packets[k]
                 if k in self.retransmit_flags:
                     del self.retransmit_flags[k]
                 if k in self.rto_recovery:
                     del self.rto_recovery[k]
 
-            # 拥塞控制（慢启动/加性增；与你原逻辑的 RL 不冲突，方便替换）
+            # Congestion control (slow start / AIMD; can be replaced with RL)
             if self.cwnd < self.ssthresh:
                 self.cwnd += 1.0
             else:
                 self.cwnd += 1.0 / max(1.0, self.cwnd)
 
         else:
-            # 乱序/错误 ACK：重复 ACK 计数
+            # Out-of-order/duplicate ACK
             self.ack_counts[acked_seq] = self.ack_counts.get(acked_seq, 0) + 1
             if self.ack_counts[acked_seq] == 3:
-                # 触发快速重传：重发丢失点 next_ack
+                # Fast retransmit: retransmit next_ack
                 self.fast_retransmit(self.next_ack)
 
-        # 送一送
+        # Try to send more
         self.maybe_fill_window()
 
     def fast_retransmit(self, seq_num):
@@ -128,22 +128,22 @@ class VideoSender(object):
             return
         pkt_info = self.sent_packets[seq_num]
         data = pkt_info['data']
-        # 标记为重传，Karn 跳过 RTT
+        # Mark as retransmitted, Karn skips RTT update
         self.retransmit_flags[seq_num] = True
         self.link_fwd.send(self.sim, self.curr_ts_ms(), 'to_receiver', 'data', data)
         self.sent_packets[seq_num]['send_time'] = self.curr_ts_ms()
 
-        # 拥塞控制：乘性减小
+        # Congestion control: multiplicative decrease
         self.ssthresh = max(2.0, self.cwnd / 2.0)
-        self.cwnd = max(2.0, self.ssthresh + 3.0)  # fast recovery 近似
+        self.cwnd = max(2.0, self.ssthresh + 3.0)  # fast recovery approx
 
-    # ===== 超时重传（仅检查最老未确认包；与原 check_timeout_retransmission 对齐） =====
+    # ===== Timeout retransmission (check oldest unacked only) =====
     def check_timeout_retransmission(self):
         now = self.curr_ts_ms()
         seq = self.next_ack
         pkt_info = self.sent_packets.get(seq)
         if pkt_info is not None and (now - pkt_info['send_time'] > pkt_info['rto']):
-            # 超时重传
+            # Timeout retransmit
             data = pkt_info['data']
             self.link_fwd.send(self.sim, now, 'to_receiver', 'data', data)
             self.sent_packets[seq]['send_time'] = now
@@ -151,12 +151,12 @@ class VideoSender(object):
             self.retransmit_flags[seq] = True
             self.rto_recovery[seq] = True
 
-            # RTO 指数退避 + 拥塞控制退避
+            # Exponential backoff and congestion control fallback
             self.rto = min(self.rto * 2, 60000)
             self.ssthresh = max(2.0, self.cwnd / 2.0)
             self.cwnd = 1.0
 
-    # ===== RTO/SRTT/RTTVAR 更新（与原名一致） =====
+    # ===== RTO/SRTT/RTTVAR update (names aligned with original) =====
     def _update_rto(self, rtt):
         rtt = float(rtt)
         if self.srtt is None:
@@ -167,9 +167,9 @@ class VideoSender(object):
             self.srtt = 0.875 * self.srtt + 0.125 * rtt
         self.rto = int(max(self.srtt + 4.0 * self.rttvar + 0.5, 200.0))
 
-    # ===== 周期驱动（替代你原 single_step/poll 事件循环） =====
+    # ===== Periodic driver (replaces original single_step/poll loop) =====
     def on_tick(self):
         self.check_timeout_retransmission()
         self.maybe_fill_window()
-        # 下一次 tick（10ms）
+        # Next tick (10ms)
         self.sim.schedule(self.sim.time_ms + 10, 'sender_tick', {})
