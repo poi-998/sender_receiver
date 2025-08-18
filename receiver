@@ -14,8 +14,8 @@ class Receiver(object):
 
     def on_data(self, data_pkt):
         """
-        输入：link.Data
-        输出：link.Ack
+        输入:link.Data
+        输出:link.Ack
         """
         seq = data_pkt.seq_num
 
@@ -52,11 +52,11 @@ class Receiver(object):
 
     def _make_ack(self, ack_seq, data_pkt):
         """
-        为了与原代码一致，ACK 字段含：
-          - seq_num: 累计 ACK 序号
-          - send_ts: 回显用于 RTT 的发送时间（近似用当前 data 的 send_ts）
-          - sent_bytes / delivered_time / delivered：沿用 Data 的元信息
-          - ack_bytes: 近似用 Data 的长度（或固定 60）
+        为了与原代码一致,ACK 字段含：
+          - seq_num:累计 ACK 序号
+          - send_ts:回显用于 RTT 的发送时间(近似用当前 data 的 send_ts)
+          - sent_bytes / delivered_time / delivered:沿用 Data 的元信息
+          - ack_bytes:近似用 Data 的长度(或固定 60)
         """
         return Ack(
             seq_num=ack_seq,
