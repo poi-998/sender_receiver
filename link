@@ -1,25 +1,25 @@
 # -*- coding: utf-8 -*-
 # Python 2.7
-# 链路与离散事件调度器；同时定义 Data/Ack 以便 sender/receiver 共享
+# Link and discrete event scheduler; also define Data/Ack for sender/receiver sharing
 
 import heapq
 import random
 
 class Data(object):
-    # 对齐你原先的 Data 字段：seq_num, send_ts, sent_bytes, delivered_time, delivered, payload
+    # Aligned with your original Data fields: seq_num, send_ts, sent_bytes, delivered_time, delivered, payload
     def __init__(self, seq_num, send_ts, sent_bytes, delivered_time, delivered, payload=""):
         self.seq_num = int(seq_num)
         self.send_ts = int(send_ts)
         self.sent_bytes = int(sent_bytes)
         self.delivered_time = int(delivered_time)
         self.delivered = int(delivered)
-        self.payload = payload  # 这里不做真实数据
+        self.payload = payload  # no real payload
 
 class Ack(object):
-    # 对齐你原先的 Ack 字段：seq_num, send_ts, sent_bytes, delivered_time, delivered, ack_bytes
+    # Aligned with your original Ack fields: seq_num, send_ts, sent_bytes, delivered_time, delivered, ack_bytes
     def __init__(self, seq_num, send_ts, sent_bytes, delivered_time, delivered, ack_bytes):
         self.seq_num = int(seq_num)
-        self.send_ts = int(send_ts)  # 回显用于 RTT 估计的发送时间
+        self.send_ts = int(send_ts)  # echo the send timestamp for RTT estimation
         self.sent_bytes = int(sent_bytes)
         self.delivered_time = int(delivered_time)
         self.delivered = int(delivered)
@@ -27,11 +27,11 @@ class Ack(object):
 
 class OneWayLink(object):
     """
-    Mahimahi 风格单向链路：
-      - 串行化：根据 rate_mbps 和数据大小计算耗时
-      - 传播时延:prop_ms
-      - 队列:queue_pkts(近似,以 in-flight 数量限制）
-      - 随机丢包:loss_prob
+    Mahimahi-style one-way link:
+      - Serialization: compute transmission time based on rate_mbps and packet size
+      - Propagation delay: prop_ms
+      - Queue: queue_pkts (approximation, limited by in-flight count)
+      - Random packet loss: loss_prob
     """
     def __init__(self, rate_mbps, prop_ms, queue_pkts, loss_prob, rng):
         self.rate_mbps = float(rate_mbps)
