@@ -29,9 +29,9 @@ class OneWayLink(object):
     """
     Mahimahi 风格单向链路：
       - 串行化：根据 rate_mbps 和数据大小计算耗时
-      - 传播时延：prop_ms
-      - 队列：queue_pkts（近似，以 in-flight 数量限制）
-      - 随机丢包：loss_prob
+      - 传播时延:prop_ms
+      - 队列:queue_pkts(近似,以 in-flight 数量限制）
+      - 随机丢包:loss_prob
     """
     def __init__(self, rate_mbps, prop_ms, queue_pkts, loss_prob, rng):
         self.rate_mbps = float(rate_mbps)
