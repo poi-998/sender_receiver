@@ -172,4 +172,4 @@ class VideoSender(object):
         self.check_timeout_retransmission()
         self.maybe_fill_window()
         # 下一次 tick（10ms）
-        self.sim.schedule(self.curr_ts_ms() + 10, 'sender_tick', {})
+        self.sim.schedule(self.sim.time_ms + 10, 'sender_tick', {})
