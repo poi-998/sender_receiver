@@ -1,0 +1,157 @@
+当然可以！下面用你这套“Sender → Link(fwd) → Receiver → Link(rev) → Sender”的四文件框架，把从发送到接收再到反馈的整个闭环逻辑，按时间与事件顺序讲清楚。你可以把它理解为一个“事件管道 + 两条单向链路 + 两端协议处理”的系统。
+
+⸻
+
+0. 参与角色与各自职责
+	•	Sender（sender.py）
+维护发送窗口（cwnd/seq_num/next_ack）、记录未确认包（sent_packets）、计算RTT/RTO、处理ACK、做快速/超时重传；定期心跳 on_tick()。
+	•	Receiver（receiver.py）
+缓存乱序、推进按序边界 last_seq_num、发累计ACK（没前进则发重复ACK）。
+	•	OneWayLink（link.py）
+Mahimahi风格单向链路：串行化（带宽决定）+ 传播时延 + 队列近似（in-flight限额） + 随机丢包；前向用于 Data，反向用于 ACK。
+	•	Simulator（放在 test.py）
+离散事件调度器：schedule(time, kind, payload) 入堆，run() 出堆推进“模拟时钟”，把事件交给 step_cb 分发。
+
+⸻
+
+1. 起步：Sender 启动并“填满窗口”
+	1.	test.py 里创建对象后，先调用：
+
+sender.maybe_fill_window()
+
+	2.	maybe_fill_window() 内部循环调用 send() 直到 in_flight = seq_num - next_ack < cwnd 不成立：
+	•	构造 Data(seq_num, send_ts, mss, ...)
+	•	（可选）发送端本地丢包：若开启 send_loss_prob，随机决定是否“本地丢弃”。正确做法是即使本地丢弃，也把该 Data 放进 sent_packets（这样定时器能超时重传）。
+	•	正常路径：调 link_fwd.send(sim, now, 'to_receiver', 'data', data)
+→ 链路计算 ser_ms、depart_ms、arrive_ms，并
+→ sim.schedule(arrive_ms, 'to_receiver', {...})
+
+此时，前向链路的 in-flight 计数 sim.link_inflight_count['to_receiver'] 会 +1（排队近似）。
+
+⸻
+
+2. 链路前向：Data 在网内的命运
+
+OneWayLink.send(...) 做四件事：
+	1.	队列溢出丢弃（近似）：如果 in_flight >= queue_pkts → 记 enq_drop，直接丢。
+	2.	随机丢包：rng.random() < loss_prob → 记 rand_drop，直接丢。
+	3.	串行化时间：ser_ms = ceil(size*8 / rate_mbps)（至少 1ms）
+	4.	排队与传播：
+	•	depart_ms = max(next_dequeue_ready_ms, now_ms) + ser_ms
+	•	arrive_ms = depart_ms + prop_ms
+	•	next_dequeue_ready_ms = depart_ms
+	•	schedule(arrive_ms, 'to_receiver', ...)
+
+只有通过①②，Data 才会被安排一个“到达接收端”的事件。否则，它从世界上“蒸发”了（这两种丢法代表链路层的丢失，而不是发送端本地丢）。
+
+⸻
+
+3. sim.run() 出堆 → 进入 step_cb
+
+sim.run(until_ms, step_cb) 会按 time_ms 升序把事件出堆，并：
+	•	推进 sim.time_ms = time_ms
+	•	若事件是 'to_receiver'/'to_sender'，先把对应方向的 in_flight 计数 减 1
+	•	把事件交给你在 test.py 里写的 step_cb(ev)
+
+在 step_cb 中：
+	•	kind == 'sender_tick' → sender.on_tick()（见第 6 节）
+	•	kind == 'to_receiver' → 交给 Receiver.on_data()（见第 4 节）
+	•	kind == 'to_sender' → 交给 Sender.update_state()（见第 5 节）
+
+⸻
+
+4. Receiver 收 Data → 生成 ACK（累计或重复）
+
+Receiver.on_data(data)：
+	1.	旧包（seq <= last_seq_num）：直接回 重复ACK（确认 last_seq_num）。
+	2.	新包：放入 received_packets[seq] 乱序缓存；
+用 while (last_seq_num+1) in received_packets: 连续前移，弹出按序到达的包；
+返回 累计ACK（确认到最新的 last_seq_num）。
+	3.	test.py 的 step_cb 里会把这个 Ack 用反向链路送回：
+
+sim.link_rev.send(sim, sim.time_ms, 'to_sender', 'ack', ack, approx_ack_size=60)
+
+反向链路与前向同理：也有队列丢/随机丢/串行化/传播。通过后会 schedule(arrive_ms2, 'to_sender', ...)。
+
+⸻
+
+5. Sender 收 ACK → 推进窗口/更新RTO/（快）重传
+
+step_cb 里 kind == 'to_sender' 时：
+	•	你通常会先打印 ACK，再 sender.update_state(ack)（防止信息被清理后拿不到）。
+
+VideoSender.update_state(ack) 逻辑：
+	•	累计ACK（ack.seq_num >= next_ack）：
+	•	next_ack = ack.seq_num + 1
+	•	清理 ack_counts 中 <= ack.seq_num 的项；
+	•	清理 sent_packets 中 <= ack.seq_num 的项；
+	•	RTT/RTO 更新（Karn规则：只用“首发样本且时间戳匹配”的 ACK）
+	•	拥塞控制：慢启动/加性增（如果你接入 RL，这里替换为动作更新即可）
+	•	然后 maybe_fill_window() 继续发包
+	•	乱序/重复ACK（ack.seq_num < next_ack）：
+	•	ack_counts[ack.seq] += 1；
+	•	达到 3 次重复ACK → fast_retransmit(next_ack)
+	•	标记 retransmit_flags[seq] = True（使这些样本不参与RTT）
+	•	立即从 前向链路重发 next_ack 对应的 Data
+	•	拥塞控制乘性减小（并进入近似快速恢复）
+
+注意：只有在 sent_packets 里存在该 seq，上述推进或重传才有依据。这就是为什么“本地丢包也要登记到 sent_packets” 的关键原因：否则“窗口占用未确认”状态会被“静默地”遗忘，系统不会自愈。
+
+⸻
+
+6. Sender 周期心跳 on_tick()：超时重传 & 继续发包
+
+Sender.on_tick() 由 sim.schedule(sim.time_ms + 10, 'sender_tick', {}) 周期触发：
+	1.	check_timeout_retransmission()：只检查最老未确认 seq = next_ack
+	•	若 now - send_time > rto：
+	•	通过 前向链路真正重发；
+	•	记录为重传样本；
+	•	RTO 指数退避、cwnd 回 1、ssthresh 减半（AIMD 退避）。
+	2.	maybe_fill_window()：如果窗口有空位，继续发新包。
+	3.	再 schedule(next_tick) 以维持心跳。
+
+这和 TCP 的 重传定时器 等价：即使没有任何 ACK 事件，系统也会靠心跳自我推进和恢复。
+
+⸻
+
+7. 事件时间轴（简化示意）
+
+t=0:   sender.maybe_fill_window() → 多个 Data 通过 link_fwd.schedule(arrive_ms, 'to_receiver')
+t=...: sim.run() 取到 'to_receiver' → receiver.on_data() → 产生 Ack → link_rev.schedule('to_sender')
+t=...: sim.run() 取到 'to_sender' → sender.update_state(ack) → 窗口推进/RTT更新/可能快重传
+每10ms: 'sender_tick' → on_tick() → 超时重传 + 继续发包
+
+
+⸻
+
+8. 两种“丢”的位置（容易混淆）
+	•	发送端本地丢包（send_loss_prob，在 send() 里）
+	•	包 不进入链路；
+	•	正确做法：也要记账到 sent_packets，让超时定时器能发现并重传；
+	•	语义上更像“应用/协议栈发送尝试失败，但序号已占用”。
+	•	链路丢包（OneWayLink.loss_prob）
+	•	包已进链路，但被队列溢出或随机丢；
+	•	由重复ACK触发快重传或超时重传恢复。
+
+⸻
+
+9. 常见坑与修复
+	•	on_tick 用真实时间：必须用 sim.time_ms 调度 sender_tick，否则时间轴错位。
+	•	本地丢包不记账：会导致既不ACK也不超时 → 系统“沉默”。修复：本地丢也写入 sent_packets。
+	•	反向链路有丢包：调试时建议 link_rev.loss_prob=0.0，看清楚ACK路径。
+	•	until_ms 太短：ACK还没到就跑完；用更大的 --until-ms 方便观察。
+	•	没触发首次发送：忘了 sender.maybe_fill_window()，全程没 Data/ACK 事件。
+
+⸻
+
+10. 你可以调的“旋钮”
+	•	--send-loss：发送端本地丢包率（测试用）
+	•	--link-loss-fwd / --link-loss-rev：链路前向/反向丢包率
+	•	--rate-mbps / --prop-ms / --queue-pkts：带宽/传播时延/队列近似容量
+	•	--until-ms：仿真时长
+	•	mss / 初始 cwnd / ssthresh：传输/拥塞控制初值
+	•	RL 接入：把 update_state() 里 “AIMD 增长那几行”换成你的 actor.predict()/take_action() 即可，其他结构都兼容。
+
+⸻
+
+如果你愿意，我可以把“本地丢包也登记到 sent_packets，由超时定时器发出第一份真实副本”的修改版 sender.py 直接贴出来，保证你开了 --send-loss 后依然能看到 ACK、拥塞窗口与 RTO 的动态闭环。
